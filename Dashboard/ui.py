@@ -94,7 +94,7 @@ class DashboardUI:
 
         # Layout
         self.center = (self.W // 2, int(self.H * 0.60))
-        base_r = int(min(self.W, self.H) * 0.46)
+        base_r = int(min(self.W, self.H) * 0.36)
         self.r_speed_outer = base_r
         self.r_speed_inner = self.r_speed_outer - self.scale(20)
 

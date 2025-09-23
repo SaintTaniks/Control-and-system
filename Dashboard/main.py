@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=480, help="Screen height")
     parser.add_argument("--windowed", action="store_true", help="Run windowed")
     parser.add_argument("--fps", type=int, default=30, help="Target FPS")
-    parser.add_argument("--units", choices=["km/h", "mph"], default="km/h",
+    parser.add_argument("--units", choices=["km/h", "mph"], default="mph",
                         help="Speed units")
     parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay")
     parser.add_argument("--cursor", action="store_true", help="Show mouse cursor")
