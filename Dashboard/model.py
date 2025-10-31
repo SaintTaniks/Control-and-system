@@ -14,8 +14,8 @@ import threading
 from typing import Any, Dict
 
 # Import all sensor readers
-from dashboard.sensors.can_reader import CANReader
-from dashboard.sensors.gpio_inputs import GPIOInputs, GPIOConfig
+from sensors.can_reader import CANReader
+from sensors.gpio_inputs import GPIOInputs, GPIOConfig
 
 # KPH to MPH conversion factor
 KPH_TO_MPH = 0.621371

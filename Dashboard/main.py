@@ -12,8 +12,8 @@ import serial
 import time
 from datetime import datetime
 
-from dashboard.ui import DashboardUI
-from dashboard.model import DataModel
+from ui import DashboardUI
+from model import DataModel
 
 # --- CONFIGURATION ---
 WIDTH, HEIGHT = 800, 480

@@ -60,7 +60,7 @@ class CANReader:
         """Starts the CAN reader threads."""
         if not self.is_running:
             self.is_running = True
-            self.canopen_thread.start()
+            #self.canopen_thread.start()
             self.broadcast_thread.start()
             print("[CANReader] All CAN threads started.")
 
