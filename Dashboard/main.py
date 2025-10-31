@@ -1,123 +1,104 @@
-# dashboard/main.py
-
-# dashboard/main.py
 """
 =============================================
  Vehicle Dashboard Main Entry Point
 =============================================
-
-This script launches the Raspberry Pi vehicle dashboard
-using pygame for rendering. It initializes the data model
-(sensor inputs or simulated data), the UI, and runs the
-main event loop.
-
-Usage
------
-Run in fullscreen mode on a Pi LCD (800x480):
-    python3 -m dashboard.main --width 800 --height 480 --fps 30 --units km/h
-
-Run windowed for development on your laptop:
-    python3 -m dashboard.main --windowed --width 1280 --height 720 --show-fps
-
-Arguments
----------
---width <int>       : Screen width (default: 800)
---height <int>      : Screen height (default: 480)
---windowed          : Run in a window instead of fullscreen
---fps <int>         : Target frames per second (default: 30)
---units [km/h|mph]  : Units for speed display (default: km/h)
---show-fps          : Show FPS counter overlay
---cursor            : Show mouse cursor (hidden by default)
-
-Notes
------
-- On Raspberry Pi with official LCD, SDL_FBDEV is set to /dev/fb0
-  to enable direct framebuffer rendering.
-- Exit with 'q' or 'ESC'.
-- Designed to auto-start via systemd service if deployed in a vehicle.
 """
 
 import os
-import sys
-import time
-import signal
 import argparse
 import pygame
+import csv
+import serial
+import time
+from datetime import datetime
 
-# Local modules
-from model import DataModel
-from ui import DashboardUI
+from dashboard.ui import DashboardUI
+from dashboard.model import DataModel
 
+# --- CONFIGURATION ---
+WIDTH, HEIGHT = 800, 480
+FPS = 30
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Vehicle Dashboard (pygame)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--width", type=int, default=800, help="Screen width")
-    parser.add_argument("--height", type=int, default=480, help="Screen height")
-    parser.add_argument("--windowed", action="store_true", help="Run windowed")
-    parser.add_argument("--fps", type=int, default=30, help="Target FPS")
-    parser.add_argument("--units", choices=["km/h", "mph"], default="mph",
-                        help="Speed units")
-    parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay")
-    parser.add_argument("--cursor", action="store_true", help="Show mouse cursor")
-    return parser.parse_args()
+# --- Set your Zigbee/Serial port here ---
+# Set to None to disable. This is for your future module.
+ZIGBEE_PORT = None 
+# Example: ZIGBEE_PORT = "/dev/ttyUSB0" 
+ZIGBEE_BAUD = 9600
 
+# --- Set to False to disable CSV logging ---
+ENABLE_LOGGING = True
+# ---------------------
 
-def configure_env_for_pi(fullscreen: bool):
-    """
-    Make SDL behave nicely on Raspberry Pi when using the LCD framebuffer.
-    Safe to call on other platforms (no-ops).
-    """
-    if fullscreen and sys.platform.startswith("linux"):
-        # If you use the Pi official LCD (framebuffer), SDL_FBDEV helps.
-        os.environ.setdefault("SDL_FBDEV", "/dev/fb0")
-        # Prevent screensaver/blanking if running under X:
-        os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+def main(args):
+    """Application entry point."""
 
-
-def install_sigint_handler():
-    # Let Ctrl+C kill the app immediately even inside pygame loop
-    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
-
-
-def main():
-    args = parse_args()
-    fullscreen = not args.windowed
-    configure_env_for_pi(fullscreen)
-    install_sigint_handler()
-
-    # Initialize pygame
+    # --- Pygame Setup ---
+    print("[main] Initializing Pygame...")
+    if not args.windowed:
+        os.environ["SDL_FBDEV"] = "/dev/fb0"
+    
     pygame.init()
-    flags = pygame.FULLSCREEN if fullscreen else 0
+    if not args.cursor and not args.windowed:
+        pygame.mouse.set_visible(False)
+    
+    flags = pygame.FULLSCREEN | pygame.DOUBLEBUF if not args.windowed else 0
     screen = pygame.display.set_mode((args.width, args.height), flags)
-    pygame.display.set_caption("Vehicle Dashboard")
-
-    # Optional: hide cursor for kiosk mode
-    pygame.mouse.set_visible(args.cursor)
-
     clock = pygame.time.Clock()
 
-    # Instantiate model & UI
-    model = DataModel(units=args.units) if "units" in DataModel.__init__.__code__.co_varnames else DataModel()
-    ui = DashboardUI(screen, units=args.units) if "units" in DashboardUI.__init__.__code__.co_varnames else DashboardUI(screen)
-
-    # If UI exposes a way to set units, do it; ignore if not present
-    if hasattr(ui, "set_units"):
+    # --- Zigbee (Serial) Setup ---
+    zigbee_port = None
+    if ZIGBEE_PORT:
         try:
-            ui.set_units(args.units)
-        except Exception:
-            pass
+            zigbee_port = serial.Serial(ZIGBEE_PORT, ZIGBEE_BAUD, timeout=0.1)
+            print(f"[main] Opened Zigbee (Serial) port at {ZIGBEE_PORT}")
+        except Exception as e:
+            print(f"[main] WARNING: Could not open Zigbee port {ZIGBEE_PORT}: {e}")
+            zigbee_port = None
 
+    # --- CSV Log File Setup ---
+    log_file = None
+    log_writer = None
+    if ENABLE_LOGGING:
+        log_filename = f"vehicle_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        try:
+            log_file = open(log_filename, 'w', newline='')
+            log_writer = csv.writer(log_file)
+            log_writer.writerow([
+                "Timestamp", "Speed", "SOC", "Pack_Voltage", 
+                "Pack_Current", "Motor_Temp", "Controller_Temp"
+            ])
+            print(f"[main] Logging data to {log_filename}")
+        except Exception as e:
+            print(f"[main] WARNING: Could not create log file: {e}")
+            log_file = None
+            log_writer = None
+
+    # --- DataModel and UI Setup ---
+    print(f"[main] Initializing DataModel (Simulate: {args.simulate})")
+    model = DataModel(
+        units=args.units,
+        simulate=args.simulate,
+        enable_can=(not args.simulate), # Only enable CAN if not simulating
+        enable_gpio=args.enable_gpio    # Use the new flag
+    )
+    
+    ui = DashboardUI(
+        screen, 
+        units=args.units, 
+        speed_max=args.speed_max
+    )
+    
+    model.start_sensors() # Start background threads (CAN, GPIO)
+    
     running = True
-    last_fps_stamp = time.time()
-    fps_value = 0
-
+    last_log_time = time.time()
+    
+    print("[main] Starting main loop...")
     try:
         while running:
-            dt = clock.tick(args.fps) / 1000.0  # seconds
+            dt = clock.tick(FPS) / 1000.0  # Delta-time in seconds
 
+            # --- Event Handling ---
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
                     running = False
@@ -125,38 +106,93 @@ def main():
                     if e.key in (pygame.K_ESCAPE, pygame.K_q):
                         running = False
 
-            # Update data model (read sensors, CAN, etc.)
-            model.update(dt)
-
-            # Draw
-            ui.render(model)
-
-            # Optional FPS overlay (top-left corner)
+            # --- Update & Render ---
+            model.update(dt) # This updates simulation OR processes real data
+            ui.render(model) # Draw the UI based on model state
+            
             if args.show_fps:
-                fps_value = 1.0 / dt if dt > 0 else 0.0
-                # Try to use UI's small font if exposed; otherwise basic system font
-                font = getattr(ui, "font_small", pygame.font.SysFont("DejaVu Sans", 16))
-                txt = font.render(f"FPS: {fps_value:5.1f}", True, (180, 180, 180))
-                screen.blit(txt, (8, 6))
+                fps = clock.get_fps()
+                fps_surf = ui.font_small.render(f"FPS: {fps:.1f}", True, (255, 255, 255))
+                screen.blit(fps_surf, (10, 10))
 
             pygame.display.flip()
 
-            # Log FPS once every ~5s when flag is on (useful for systemd logs)
-            if args.show_fps and (time.time() - last_fps_stamp) > 5:
-                print(f"[dashboard] FPS ~ {fps_value:0.1f}")
-                last_fps_stamp = time.time()
+            # --- Data Logging and Sending (every 0.5s) ---
+            current_time = time.time()
+            if current_time - last_log_time >= 0.5:
+                last_log_time = current_time
+                
+                data_to_log = model.get_all_data()
 
-    except SystemExit:
-        # Normal exit via sys.exit or SIGINT
-        pass
+                # 1. Send to Zigbee
+                if zigbee_port:
+                    try:
+                        # Create a simple string message. Example: "S:50.1,B:88.2\n"
+                        zigbee_msg = (
+                            f"S:{data_to_log.get('speed', 0):.1f},"
+                            f"B:{data_to_log.get('soc', 0):.1f},"
+                            f"T:{data_to_log.get('temp', 0):.1f}\n"
+                        )
+                        zigbee_port.write(zigbee_msg.encode('ascii'))
+                    except Exception as e:
+                        print(f"[main] Zigbee write error: {e}")
+
+                # 2. Write to CSV Log
+                if log_writer:
+                    try:
+                        data_row = [
+                            f"{current_time:.2f}",
+                            f"{data_to_log.get('speed', 0):.2f}",
+                            f"{data_to_log.get('soc', 0):.2f}",
+                            f"{data_to_log.get('v_pack', 0):.2f}",
+                            f"{data_to_log.get('i_pack', 0):.2f}",
+                            f"{data_to_log.get('temp', 0):.1f}",
+                            f"{data_to_log.get('controller_temp', 0):.1f}"
+                        ]
+                        log_writer.writerow(data_row)
+                    except Exception as e:
+                        print(f"[main] CSV write error: {e}")
+                        
     except Exception as ex:
-        # Print traceback so systemd/journalctl can capture it
-        print(f"[dashboard] Unhandled exception: {ex}", file=sys.stderr)
+        print(f"[main] CRITICAL ERROR: {ex}")
         import traceback
         traceback.print_exc()
+    
     finally:
+        # --- Cleanup ---
+        print("[main] Shutting down...")
+        model.stop() # Tell sensors to stop
+        if zigbee_port and zigbee_port.is_open:
+            zigbee_port.close()
+            print("[main] Zigbee port closed.")
+        if log_file:
+            log_file.close()
+            print("[main] Log file saved.")
         pygame.quit()
-
+        print("[main] Shutdown complete.")
 
 if __name__ == "__main__":
-    main()
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="ERA Vehicle Dashboard")
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--windowed", action="store_true", help="Run in a window")
+    parser.add_argument("--units", type=str, default="km/h", choices=["km/h", "mph"])
+    parser.add_argument("--show-fps", action="store_true")
+    parser.add_argument("--cursor", action="store_true", help="Show mouse cursor")
+    parser.add_argument("--speed-max", type=int, default=100, help="Max speed on gauge")
+    
+    parser.add_argument(
+        "--simulate", 
+        action="store_true", 
+        help="Run with simulated data instead of hardware"
+    )
+    # --- NEW FLAG FOR GPIO ---
+    parser.add_argument(
+        "--enable-gpio", 
+        action="store_true", 
+        help="Enable hardware GPIO inputs (blinkers, etc.)"
+    )
+    
+    args = parser.parse_args()
+    main(args)

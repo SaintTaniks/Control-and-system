@@ -1,218 +1,175 @@
-# dashboard/sensors/can_reader.py
 """
 =============================================
- CAN Bus Reader for Vehicle Dashboard
+ CAN Bus Reader (All-in-One)
 =============================================
-
-Encapsulates CAN interface setup and decoding of vehicle messages:
-- Speed, gear, controller temp, blinkers
-- Battery telemetry: pack voltage (V), current (A), state-of-charge (%)
-
-Requires: python-can  (pip install python-can)
-
-Integration (example)
----------------------
-from sensors.can_reader import CANReader, CANConfig
-
-cfg = CANConfig(
-    channel="can0", bustype="socketcan", bitrate=500000,
-    id_speed=0x123, id_gear=0x124, id_temp=0x125, id_blink=0x126,
-    id_batt_soc=0x180, id_batt_v=0x181, id_batt_i=0x182
-)
-reader = CANReader(cfg)
-
-data = reader.poll()
-if data.soc is not None:
-    print("SOC:", data.soc, "%")
-if data.v_pack is not None and data.i_pack is not None:
-    print("Power ~", data.v_pack * data.i_pack, "W")
-
-Notes
------
-- All scaling shown is EXAMPLE ONLY. Replace with your DBC mappings.
-- Endianness and signedness matter! (big-endian vs little-endian; signed current).
+Manages all CAN bus communication by running two dedicated threads:
+1. A listener for broadcast messages (BMS, Gear, Blinkers).
+2. A poller for SEVCON Gen4 using the CANopen protocol.
+This class directly updates the DataModel object that is passed to it.
 """
 
-from __future__ import annotations
-import typing as t
+import threading
+import time
+import can
+import canopen
 
-try:
-    import can
-except ImportError:
-    can = None
+# --- CONFIGURATION - VERIFY THESE VALUES ---
 
+# 1. CAN Interface
+CAN_INTERFACE = 'can0' # 'sudo ip link set can0 up type can bitrate 500000'
 
-class CANConfig:
-    """CAN IDs and scaling functions for your vehicle signals."""
-    def __init__(
-        self,
-        *,
-        channel: str = "can0",
-        bustype: str = "socketcan",
-        bitrate: int = 500000,
-        # Drivetrain / status
-        id_speed: int = 0x123,
-        id_gear: int = 0x124,
-        id_temp: int = 0x125,
-        id_blink: int = 0x126,
-        # Battery telemetry (set to your real IDs)
-        id_batt_soc: int | None = 0x180,
-        id_batt_v: int | None = 0x181,
-        id_batt_i: int | None = 0x182,
-        # Optional combined frame (if your BMS packs V/I/SOC together)
-        id_batt_combo: int | None = None,
-    ):
-        self.channel = channel
-        self.bustype = bustype
-        self.bitrate = bitrate
+# 2. SEVCON Node ID (CANopen)
+SEVCON_NODE_ID = 1  # Example: 1 (Verify this in your SEVCON config)
 
-        self.id_speed = id_speed
-        self.id_gear = id_gear
-        self.id_temp = id_temp
-        self.id_blink = id_blink
+# 3. Orion BMS CAN IDs (Extended 29-bit IDs)
+# These are examples. Replace with your actual IDs.
+BMS_BROADCAST_ID_1 = 0x1806E5F4  # (BMS) Contains Pack Voltage and Current
+BMS_BROADCAST_ID_2 = 0x1806E7F4  # (BMS) Contains High/Low Cell V, SOC
 
-        self.id_batt_soc = id_batt_soc
-        self.id_batt_v = id_batt_v
-        self.id_batt_i = id_batt_i
-        self.id_batt_combo = id_batt_combo
+# 4. Other Vehicle CAN IDs (Standard 11-bit IDs)
+# These are placeholders. Replace with your actual IDs.
+ID_GEAR = 0x124                  # (Vehicle) Gear Status (P, R, N, D)
+ID_BLINK = 0x126                 # (Vehicle) Turn signals
 
-    # ------------- Decoders (EDIT to match your DBC) -------------
-    # Speed: 2 bytes big-endian; 0.01 km/h per unit
-    def decode_speed(self, data: bytes) -> float:
-        if len(data) < 2:
-            return 0.0
-        raw = int.from_bytes(data[0:2], "big", signed=False)
-        return raw * 0.01
-
-    # Gear: 1 byte enum
-    def decode_gear(self, data: bytes) -> str:
-        if not data:
-            return "N"
-        mapping = {0: "P", 1: "R", 2: "N", 3: "D"}
-        return mapping.get(data[0], "N")
-
-    # Controller temp: 1 byte °C
-    def decode_temp(self, data: bytes) -> float:
-        return float(data[0]) if data else 25.0
-
-    # Blinkers: bit0=left, bit1=right
-    def decode_blinkers(self, data: bytes) -> tuple[bool, bool]:
-        if not data:
-            return False, False
-        b = data[0]
-        return bool(b & 0x01), bool(b & 0x02)
-
-    # Battery SOC: 1 byte => 0.5% per unit (EXAMPLE)
-    def decode_batt_soc(self, data: bytes) -> float:
-        if not data:
-            return 0.0
-        return min(100.0, max(0.0, data[0] * 0.5))
-
-    # Battery voltage: 2 bytes big-endian; 0.1 V per unit (EXAMPLE)
-    def decode_batt_voltage(self, data: bytes) -> float:
-        if len(data) < 2:
-            return 0.0
-        raw = int.from_bytes(data[0:2], "big", signed=False)
-        return raw * 0.1
-
-    # Battery current: 2 bytes big-endian; signed; 0.1 A per unit (EXAMPLE)
-    # Convention: positive = discharge, negative = charge (adjust to BMS)
-    def decode_batt_current(self, data: bytes) -> float:
-        if len(data) < 2:
-            return 0.0
-        raw = int.from_bytes(data[0:2], "big", signed=True)
-        return raw * 0.1
-
-    # If your BMS sends combined frame (example layout):
-    # Byte0: SOC_raw (0.5%/LSB)
-    # Byte1-2: V_pack (0.1V/LSB, big-endian)
-    # Byte3-4: I_pack (0.1A/LSB, big-endian, signed)
-    def decode_batt_combo(self, data: bytes) -> tuple[float | None, float | None, float | None]:
-        if len(data) < 5:
-            return None, None, None
-        soc = self.decode_batt_soc(data[0:1])
-        v = self.decode_batt_voltage(data[1:3])
-        i = self.decode_batt_current(data[3:5])
-        return soc, v, i
-
-
-class CANData(t.NamedTuple):
-    """Latest decoded values; fields are None if not updated this poll."""
-    # Drivetrain / status
-    speed: t.Optional[float] = None      # km/h
-    gear: t.Optional[str] = None
-    temp: t.Optional[float] = None       # °C
-    turn_left: t.Optional[bool] = None
-    turn_right: t.Optional[bool] = None
-    # Battery
-    soc: t.Optional[float] = None        # %
-    v_pack: t.Optional[float] = None     # V
-    i_pack: t.Optional[float] = None     # A (sign convention per BMS)
+# --- END OF CONFIGURATION ---
 
 
 class CANReader:
-    def __init__(self, config: CANConfig):
-        if can is None:
-            raise RuntimeError("python-can not installed; please `pip install python-can`.")
-        self.cfg = config
-        try:
-            self.bus = can.interface.Bus(
-                channel=config.channel,
-                bustype=config.bustype,
-                bitrate=config.bitrate
-            )
-            print(f"[can_reader] CAN bus up on {config.channel} ({config.bitrate} bps)")
-        except Exception as ex:
-            raise RuntimeError(f"[can_reader] Failed to open CAN: {ex}")
-
-    def poll(self, max_msgs: int = 32, timeout: float = 0.0) -> CANData:
+    def __init__(self, data_model):
         """
-        Non-blocking poll. Reads up to `max_msgs` messages from the bus and
-        returns a CANData with the latest values seen in this call.
+        Initializes the CAN reader.
+        Args:
+            data_model: The main DataModel instance to update.
         """
-        values: dict[str, t.Any] = {}
-        cnt = 0
-        try:
-            msg = self.bus.recv(timeout=timeout)
-            while msg and cnt < max_msgs:
-                arb = msg.arbitration_id
-                data = bytes(msg.data)
+        self.data_model = data_model
+        self.is_running = False
+        
+        # Thread for SEVCON (CANopen)
+        self.canopen_thread = threading.Thread(
+            target=self.sevcon_canopen_poller, 
+            daemon=True
+        )
+        
+        # Thread for BMS/Vehicle (Standard CAN)
+        self.broadcast_thread = threading.Thread(
+            target=self.bms_broadcast_listener, 
+            daemon=True
+        )
 
-                if arb == self.cfg.id_speed:
-                    values["speed"] = self.cfg.decode_speed(data)
+    def start(self):
+        """Starts the CAN reader threads."""
+        if not self.is_running:
+            self.is_running = True
+            self.canopen_thread.start()
+            self.broadcast_thread.start()
+            print("[CANReader] All CAN threads started.")
 
-                elif arb == self.cfg.id_gear:
-                    values["gear"] = self.cfg.decode_gear(data)
+    def stop(self):
+        """Stops the CAN reader threads."""
+        self.is_running = False
+        print("[CANReader] Stop signal sent.")
 
-                elif arb == self.cfg.id_temp:
-                    values["temp"] = self.cfg.decode_temp(data)
+    def bms_broadcast_listener(self):
+        """
+        Listens for standard 11-bit and extended 29-bit CAN messages
+        from BMS, gear selector, blinkers, etc.
+        """
+        print("[CANReader] BMS/Broadcast Listener thread started.")
+        bus = None
+        while self.is_running:
+            try:
+                if bus is None:
+                    bus = can.interface.Bus(CAN_INTERFACE, bustype='socketcan')
+                    print("[CANReader] Broadcast Listener: CAN bus connected.")
+                
+                msg = bus.recv(timeout=1.0) # Wait for a message
+                if msg is None:
+                    continue
 
-                elif arb == self.cfg.id_blink:
-                    left, right = self.cfg.decode_blinkers(data)
-                    values["turn_left"], values["turn_right"] = left, right
+                # --- 29-bit Extended ID (BMS) ---
+                if msg.is_extended_id:
+                    if msg.arbitration_id == BMS_BROADCAST_ID_1:
+                        # --- DECODE BMS_BROADCAST_ID_1 ---
+                        # Example: Bytes 0-1 = Pack V (0.1V scale)
+                        # Example: Bytes 2-3 = Pack I (0.1A scale, signed)
+                        pack_v = ((msg.data[0] << 8) | msg.data[1]) * 0.1
+                        pack_i = ((msg.data[2] << 8) | msg.data[3]) * 0.1
+                        
+                        self.data_model.update_value('v_pack', pack_v)
+                        self.data_model.update_value('i_pack', pack_i)
 
-                # Battery frames
-                elif self.cfg.id_batt_combo is not None and arb == self.cfg.id_batt_combo:
-                    soc, v, i = self.cfg.decode_batt_combo(data)
-                    if soc is not None:
-                        values["soc"] = soc
-                    if v is not None:
-                        values["v_pack"] = v
-                    if i is not None:
-                        values["i_pack"] = i
-
+                    elif msg.arbitration_id == BMS_BROADCAST_ID_2:
+                        # --- DECODE BMS_BROADCAST_ID_2 ---
+                        # Example: Byte 0 = SOC (1% scale)
+                        soc = msg.data[0] * 1.0
+                        self.data_model.update_value('soc', soc)
+                
+                # --- 11-bit Standard ID (Vehicle) ---
                 else:
-                    if self.cfg.id_batt_soc is not None and arb == self.cfg.id_batt_soc:
-                        values["soc"] = self.cfg.decode_batt_soc(data)
-                    if self.cfg.id_batt_v is not None and arb == self.cfg.id_batt_v:
-                        values["v_pack"] = self.cfg.decode_batt_voltage(data)
-                    if self.cfg.id_batt_i is not None and arb == self.cfg.id_batt_i:
-                        values["i_pack"] = self.cfg.decode_batt_current(data)
+                    if msg.arbitration_id == ID_GEAR:
+                        # --- DECODE ID_GEAR ---
+                        gear_map = {0: "P", 1: "R", 2: "N", 3: "D"}
+                        gear_val = msg.data[0]
+                        self.data_model.update_value('gear', gear_map.get(gear_val, "?"))
 
-                msg = self.bus.recv(timeout=0.0)
-                cnt += 1
-        except Exception:
-            # swallow transient CAN errors; keep last known values upstream
-            pass
+                    elif msg.arbitration_id == ID_BLINK:
+                        # --- DECODE ID_BLINK ---
+                        # This code will be overridden if GPIO is enabled
+                        blink_val = msg.data[0]
+                        self.data_model.update_value('turn_left', blink_val in [1, 3])
+                        self.data_model.update_value('turn_right', blink_val in [2, 3])
+                        
+            except Exception as e:
+                if self.is_running:
+                    print(f"[CANReader] Broadcast Listener Error: {e}")
+                    if bus:
+                        bus.shutdown()
+                    bus = None
+                    time.sleep(3) # Wait before retrying
 
-        return CANData(**values)
+    def sevcon_canopen_poller(self):
+        """Polls the SEVCON controller via CANopen and updates the data model."""
+        print("[CANReader] SEVCON Poller thread started.")
+        network = None
+        node = None
+
+        while self.is_running:
+            try:
+                if network is None:
+                    network = canopen.Network()
+                    network.connect(channel=CAN_INTERFACE, bustype='socketcan')
+                    node = network.add_node(SEVCON_NODE_ID)
+                    print("[CANReader] SEVCON Poller: CANopen network connected.")
+
+                # --- Poll for data (using SDO read) ---
+                # These are examples, replace with your SDO objects
+                
+                # Example: Motor Speed (RPM)
+                motor_speed_rpm = node.sdo[0x2915].raw # Adjust object index
+                
+                # --- !! CONVERT RPM to KPH !! ---
+                # This is a placeholder. You MUST calculate this.
+                WHEEL_CIRCUMFERENCE_M = 1.8 # Example: 1.8 meters
+                GEAR_RATIO = 10.0             # Example: 10:1
+                KPH = (motor_speed_rpm * (WHEEL_CIRCUMFERENCE_M / 1000) * 60) / GEAR_RATIO
+                
+                self.data_model.update_value('speed', KPH)
+
+                # Example: Motor Temp
+                motor_temp = node.sdo[0x2904].raw * 0.1 # Adjust object/scale
+                self.data_model.update_value('temp', motor_temp)
+                
+                # Example: Controller Temp
+                controller_temp = node.sdo[0x2903].raw * 0.1 # Adjust object/scale
+                self.data_model.update_value('controller_temp', controller_temp)
+
+                time.sleep(0.1) # Poll at 10Hz
+
+            except Exception as e:
+                if self.is_running:
+                    print(f"[CANReader] SEVCON Poller Error: {e}")
+                    if network:
+                        network.disconnect()
+                    network = None
+                    node = None
+                    time.sleep(3) # Wait before retrying
