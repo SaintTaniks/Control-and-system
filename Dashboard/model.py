@@ -184,7 +184,16 @@ class DataModel:
             self.soc = abs(75 + (20 * math.sin(t * 0.2)))
             self.v_pack = 52.5 + (2.1 * math.sin(t * 0.2))
             self.i_pack = 30 + (25 * math.sin(t * 0.8))
+
+            # Simulate a base speed in KPH
+            base_speed_kph = 80 + (20 * math.sin(t * 0.5))
             
+            # Convert to MPH if needed
+            if self.units == 'mph':
+                self.speed = base_speed_kph * KPH_TO_MPH
+            else:
+                self.speed = base_speed_kph
+
             # Simulate GPIO data (blinkers)
             blink_state = int(t * 2) % 2 == 0
             if int(t) % 10 < 5:

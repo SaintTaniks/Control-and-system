@@ -177,11 +177,11 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=WIDTH)
     parser.add_argument("--height", type=int, default=HEIGHT)
     parser.add_argument("--windowed", action="store_true", help="Run in a window")
-    parser.add_argument("--units", type=str, default="km/h", choices=["km/h", "mph"])
     parser.add_argument("--show-fps", action="store_true")
     parser.add_argument("--cursor", action="store_true", help="Show mouse cursor")
-    parser.add_argument("--speed-max", type=int, default=100, help="Max speed on gauge")
-    
+    parser.add_argument("--units", type=str, default="mph", choices=["km/h", "mph"])
+    parser.add_argument("--speed-max", type=int, default=120, help="Max speed on gauge")
+
     parser.add_argument(
         "--simulate", 
         action="store_true", 
