@@ -88,38 +88,43 @@ class DashboardUI:
         self,
         screen: pygame.Surface,
         units: str = "mph",
-        speed_max: int = 120,
+        speed_max: int = 100,  
         theme: str = "dark"
     ):
         self.screen = screen
         self.W, self.H = screen.get_size()
         self.units = units
-        self.speed_max = speed_max
+        
+        # FORCING speed_max to 100 here so main.py cannot override it!
+        self.speed_max = 100 
+        
         self.last_warn = False
         
         # --- Colors ---
-        self.BG = (0, 0, 0)             # Black background
+        self.BG = (15, 15, 20)          # Deep dark gray/black background
         self.FG = (240, 240, 240)       # Bright white/light-gray
-        self.FG_LIGHT = (100, 100, 100) # Dim gray for background gauge
-        self.DANGER = (255, 0, 0)       # Red for needle and warnings
+        self.FG_LIGHT = (100, 100, 110) # Dim gray for labels and background gauge
+        self.DANGER = (255, 50, 50)     # Red for needle and warnings
         self.AMBER = (255, 191, 0)      # Amber for warnings
-        self.GREEN = (0, 200, 0)        # Green for SOC/headlights
+        self.GREEN = (0, 200, 100)      # Green for SOC/headlights
         
         # --- Font loading ---
         try:
-            # Load default font. 
-            # Replace 'None' with "YourFont.ttf" to load a custom font file.
             font_name = None 
-            self.font_small = pygame.font.Font(font_name, self.scale(24))
+            self.font_small = pygame.font.Font(font_name, self.scale(24)) 
             self.font_mid = pygame.font.Font(font_name, self.scale(36))
             self.font_large = pygame.font.Font(font_name, self.scale(130))
+            self.font_corner_lbl = pygame.font.Font(font_name, self.scale(30))
+            self.font_corner_val = pygame.font.Font(font_name, self.scale(48))
         except Exception as e:
             if font_name:
                 print(f"Warning: Could not load custom font '{font_name}'. {e}")
                 print("Falling back to default system font 'Arial'.")
             self.font_small = pygame.font.SysFont("Arial", self.scale(24))
-            self.font_mid = pygame.font.SysFont("Arial", self.scale(36))
-            self.font_large = pygame.font.SysFont("Arial", self.scale(130))
+            self.font_mid = pygame.font.SysFont("Arial", self.scale(36), bold=True)
+            self.font_large = pygame.font.SysFont("Arial", self.scale(130), bold=True)
+            self.font_corner_lbl = pygame.font.SysFont("Arial", self.scale(30))
+            self.font_corner_val = pygame.font.SysFont("Arial", self.scale(48), bold=True)
 
     def scale(self, x: int) -> int:
         """Scales a pixel dimension based on screen height (baseline 480)."""
@@ -131,42 +136,76 @@ class DashboardUI:
         # --- Fill background ---
         self.screen.fill(self.BG)
         
-        # --- Draw Gauges ---
+        # --- Safely Fetch Data ---
+        speed = getattr(model, 'speed', 0.0)
+        soc = getattr(model, 'soc', 0.0)
+        temp = getattr(model, 'battery_temp', getattr(model, 'temp', 0.0))
+        voltage = getattr(model, 'pack_voltage', 0.0)
+        current = getattr(model, 'current', 0.0)
+        high_cell = getattr(model, 'high_cell_voltage', 0.0)
+        low_cell = getattr(model, 'low_cell_voltage', 0.0)
+        
+        turn_left = getattr(model, 'turn_left', False)
+        turn_right = getattr(model, 'turn_right', False)
+        gear = getattr(model, 'gear', "P")
+        headlight = getattr(model, 'headlight', False)
+        warn = getattr(model, 'warn', False)
+
+        # --- Draw Center Speedometer ---
         self._draw_speed_gauge(
-            model.speed,
+            speed,
             (int(self.W * 0.5), int(self.H * 0.55)), # Center
             self.scale(180), # Radius
             self.scale(25)   # Line width
         )
         
-        self._draw_soc_gauge(
-            model.soc,
-            (int(self.W * 0.15), int(self.H * 0.7)), # Moved from 0.2
-            self.scale(60),
-            self.scale(10)
-        )
+        # --- Draw Corner Data Blocks ---
+        pad_x = self.scale(40)
+        pad_y = self.scale(40)
         
-        self._draw_temp_gauge(
-            model.temp,
-            (int(self.W * 0.85), int(self.H * 0.7)), # Moved from 0.8
-            self.scale(60),
-            self.scale(10)
-        )
+        # -- TOP LEFT: State of Charge --
+        soc_color = self.GREEN if soc > 20 else self.DANGER
+        self._draw_text_block("SOC", f"{soc:.1f} %", pad_x, pad_y, align="left", val_color=soc_color)
+        
+        # -- TOP RIGHT: Voltage & Current --
+        self._draw_text_block("PACK VOLTAGE", f"{voltage:.1f} V", self.W - pad_x, pad_y, align="right")
+        self._draw_text_block("CURRENT", f"{current:.1f} A", self.W - pad_x, pad_y + self.scale(75), align="right")
+        
+        # -- BOTTOM LEFT: Cell Voltages (Stacked) --
+        # CHANGED: Increased the offset from 50 to 85 to lift the elements further up
+        bottom_y = self.H - pad_y - self.scale(85)
+        self._draw_text_block("MAX CELL", f"{high_cell:.2f} V", pad_x, bottom_y - self.scale(75), align="left")
+        self._draw_text_block("MIN CELL", f"{low_cell:.2f} V", pad_x, bottom_y, align="left")
+        
+        # -- BOTTOM RIGHT: Temperature --
+        temp_color = self.DANGER if temp > 50 else self.FG
+        self._draw_text_block("TEMP", f"{temp:.1f} °C", self.W - pad_x, bottom_y, align="right", val_color=temp_color)
 
         # --- Draw Indicators ---
-        self._draw_indicators(
-            model.turn_left,
-            model.turn_right,
-            model.gear,
-            model.headlight,
-            model.warn
-        )
+        self._draw_indicators(turn_left, turn_right, gear, headlight, warn)
+
+    def _draw_text_block(self, label: str, value_str: str, x: int, y: int, align: str = "left", val_color=None):
+        """Helper to cleanly draw stacked Label/Value text in the corners."""
+        if val_color is None:
+            val_color = self.FG
+            
+        lbl_surf = self.font_corner_lbl.render(label, True, self.FG_LIGHT)
+        val_surf = self.font_corner_val.render(value_str, True, val_color)
+        
+        if align == "left":
+            lbl_rect = lbl_surf.get_rect(bottomleft=(x, y - 2))
+            val_rect = val_surf.get_rect(topleft=(x, y + 2))
+        else: # align == "right"
+            lbl_rect = lbl_surf.get_rect(bottomright=(x, y - 2))
+            val_rect = val_surf.get_rect(topright=(x, y + 2))
+            
+        self.screen.blit(lbl_surf, lbl_rect)
+        self.screen.blit(val_surf, val_rect)
 
     def _draw_speed_gauge(self, speed: float, center: Tuple[int, int], radius: int, line_width: int):
         """
         --- FINAL GAUGE (CLOCKWISE) ---
         Draws the main speed gauge.
-        0 (bottom-left) -> 60 (top) -> 120 (bottom-right)
         """
         cx, cy = center
         
@@ -185,7 +224,8 @@ class DashboardUI:
         LABEL_START_ANGLE_MATH = 210 # 7 o'clock
         LABEL_END_ANGLE_MATH = -30   # 5 o'clock (or 330)
         
-        num_labels = 7 # 0, 20, 40, 60, 80, 100, 120
+        # 6 labels: 0, 20, 40, 60, 80, 100
+        num_labels = 6 
         for i in range(num_labels):
             val_frac = i / (num_labels - 1.0)
             val = int(val_frac * self.speed_max)
@@ -227,112 +267,6 @@ class DashboardUI:
         ])
         pygame.draw.circle(self.screen, self.FG_LIGHT, (cx, cy), self.scale(15))
 
-
-    def _draw_soc_gauge(self, soc: float, center: Tuple[int, int], radius: int, line_width: int):
-        """Draws the SOC gauge (battery)."""
-        cx, cy = center
-        soc_frac = clamp(soc, 0, 100) / 100.0
-        
-        # --- NEW SOC COLORS ---
-        soc_color = self.GREEN  # Default green
-        if soc < 20:
-            soc_color = self.DANGER
-        elif soc < 50: # 20-49%
-            soc_color = self.AMBER
-
-        # --- 1. Draw Background Arc (Open at bottom) ---
-        ARC_START_RAD = math.radians(330) # 5 o'clock
-        ARC_END_RAD = math.radians(210 + 360) # 7 o'clock (one turn later)
-        
-        pygame.draw.arc(
-            self.screen, self.FG_LIGHT,
-            (cx - radius, cy - radius, radius * 2, radius * 2),
-            ARC_START_RAD, ARC_END_RAD, line_width
-        )
-        
-        # --- 2. Draw FG (Fill CLOCKWISE from left to right) ---
-        # 
-        # *** FIX ***
-        # The fill must use the same angle space as the background arc to line up.
-        # Background arc draws CCW from 330 to 570 (210+360).
-        # Fill (CW) must map from 0-100% to the range [570, 330].
-        
-        FILL_START_ANGLE_MATH = 210 + 360 # 7 o'clock (570)
-        FILL_END_ANGLE_MATH = 330         # 5 o'clock (330)
-        
-        # Calculate the angle for the current value
-        fill_angle_deg_current = map_range(soc_frac, 0.0, 1.0, FILL_START_ANGLE_MATH, FILL_END_ANGLE_MATH)
-
-        # We only draw if the value is > 0 
-        if soc_frac > 0.0:
-            # Pygame draws CCW. To draw CW from 570 to current, we draw CCW from current to 570.
-            start_rad_pygame = math.radians(fill_angle_deg_current)
-            end_rad_pygame = math.radians(FILL_START_ANGLE_MATH) # End at 570
-            
-            pygame.draw.arc(
-                self.screen, soc_color,
-                (cx - radius, cy - radius, radius * 2, radius * 2),
-                start_rad_pygame,
-                end_rad_pygame,
-                line_width
-            )
-        
-        draw_label(self.screen, f"{soc:3.0f}%", (cx, cy), self.font_mid, soc_color)
-        draw_label(self.screen, "SOC", (cx, cy + self.scale(30)), self.font_small, self.FG_LIGHT)
-
-    def _draw_temp_gauge(self, temp: float, center: Tuple[int, int], radius: int, line_width: int):
-        """Draws the Temperature gauge."""
-        cx, cy = center
-        temp_max = 100.0  # Assume 100 C max
-        temp_frac = clamp(temp, 0, temp_max) / temp_max
-        
-        temp_color = self.FG
-        if temp > 90:
-            temp_color = self.DANGER
-        elif temp > 80:
-            temp_color = self.AMBER
-
-        # --- 1. Draw Background Arc (Open at bottom) ---
-        ARC_START_RAD = math.radians(330) # 5 o'clock
-        ARC_END_RAD = math.radians(210 + 360) # 7 o'clock (one turn later)
-        
-        pygame.draw.arc(
-            self.screen, self.FG_LIGHT,
-            (cx - radius, cy - radius, radius * 2, radius * 2),
-            ARC_START_RAD, ARC_END_RAD, line_width
-        )
-        
-        # --- 2. Draw FG (Fill CLOCKWISE from left to right) ---
-        # 
-        # *** FIX ***
-        # The fill must use the same angle space as the background arc to line up.
-        # Background arc draws CCW from 330 to 570 (210+360).
-        # Fill (CW) must map from 0-100% to the range [570, 330].
-        
-        FILL_START_ANGLE_MATH = 210 + 360 # 7 o'clock (570)
-        FILL_END_ANGLE_MATH = 330         # 5 o'clock (330)
-        
-        # Calculate the angle for the current value
-        fill_angle_deg_current = map_range(temp_frac, 0.0, 1.0, FILL_START_ANGLE_MATH, FILL_END_ANGLE_MATH)
-
-        # We only draw if the value is > 0 
-        if temp_frac > 0.0:
-            # Pygame draws CCW. To draw CW from 570 to current, we draw CCW from current to 570.
-            start_rad_pygame = math.radians(fill_angle_deg_current)
-            end_rad_pygame = math.radians(FILL_START_ANGLE_MATH) # End at 570
-            
-            pygame.draw.arc(
-                self.screen, temp_color,
-                (cx - radius, cy - radius, radius * 2, radius * 2),
-                start_rad_pygame,
-                end_rad_pygame,
-                line_width
-            )
-        
-        # --- NEW LABELS ---
-        draw_label(self.screen, f"{temp:3.0f}°C", (cx, cy), self.font_mid, temp_color)
-        draw_label(self.screen, "TEMP", (cx, cy + self.scale(30)), self.font_small, self.FG_LIGHT)
-
     def _draw_indicators(
         self,
         left_on: bool,
@@ -342,21 +276,12 @@ class DashboardUI:
         warn: bool
     ):
         """Draws all the top/bottom indicators."""
-        
-        # --- Blinkers (Top) ---
-        # [DELETED BY USER REQUEST]
-        
-        # --- Gear (Center Top) ---
-        # [DELETED BY USER REQUEST]
-        
-        # --- Headlight (Bottom Left) ---
-        # [REMOVED BY USER REQUEST]
-
         # --- Warning (Bottom Right) ---
         if warn:
             # Flash the warning
             warn_color = self.DANGER if int(pygame.time.get_ticks() / 300) % 2 == 0 else self.BG
-            x, y = int(self.W * 0.92), int(self.H * 0.9)
+            # Lifted this slightly as well just in case!
+            x, y = int(self.W * 0.92), int(self.H * 0.88)
             pygame.draw.polygon(self.screen, warn_color, [
                 (x, y - self.scale(20)),
                 (x - self.scale(25), y + self.scale(15)),
@@ -364,5 +289,3 @@ class DashboardUI:
             ])
             # Draw "!" inside
             draw_label(self.screen, "!", (x, y + self.scale(5)), self.font_mid, self.BG)
-
-
